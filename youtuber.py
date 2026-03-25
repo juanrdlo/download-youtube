@@ -1,9 +1,12 @@
 import os
 import queue
 import shutil
+import ssl
+import sys
 import threading
 import webbrowser
 from io import BytesIO
+from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.request import urlopen
@@ -17,6 +20,11 @@ try:
 	import imageio_ffmpeg
 except ImportError:  # pragma: no cover - optional dependency
 	imageio_ffmpeg = None
+
+try:
+	import certifi
+except ImportError:  # pragma: no cover - optional dependency
+	certifi = None
 
 try:
 	from PIL import Image, ImageTk
@@ -53,6 +61,7 @@ class YouTubeDownloaderApp:
 		self.thumbnail_images = {}
 		self.placeholder_thumb = None
 		self.ffmpeg_location = self._resolve_ffmpeg_location()
+		self.ca_bundle_path = self._configure_ssl_certificates()
 
 		self._build_ui()
 		self._poll_queue()
@@ -67,12 +76,38 @@ class YouTubeDownloaderApp:
 			)
 		elif Image is None:
 			self._log("Pillow no esta instalado: no se mostraran miniaturas.")
+		if self.ca_bundle_path:
+			self._log(f"Certificados SSL configurados: {self.ca_bundle_path}")
+		elif certifi is None:
+			self._log("Sugerencia: instala certifi para evitar errores SSL (pip install certifi).")
 		if self.ffmpeg_location:
 			self._log(f"ffmpeg detectado: {self.ffmpeg_location}")
 		else:
 			self._log("ffmpeg no detectado: para mejor opcion 1080p instala ffmpeg o imageio-ffmpeg.")
 
-	def _resolve_ffmpeg_location(self) -> str | None:
+	def _configure_ssl_certificates(self) -> Optional[str]:
+		if certifi is None:
+			return None
+		try:
+			ca_bundle_path = certifi.where()
+		except Exception:
+			return None
+		if not ca_bundle_path or not os.path.exists(ca_bundle_path):
+			return None
+		os.environ["SSL_CERT_FILE"] = ca_bundle_path
+		os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
+		return ca_bundle_path
+
+	@staticmethod
+	def _is_ssl_certificate_error(exc: Exception) -> bool:
+		message = str(exc).lower()
+		return (
+			"certificate_verify_failed" in message
+			or "certificateverifyerror" in message
+			or "unable to get local issuer certificate" in message
+		)
+
+	def _resolve_ffmpeg_location(self) -> Optional[str]:
 		system_ffmpeg = shutil.which("ffmpeg")
 		if system_ffmpeg:
 			return system_ffmpeg
@@ -358,15 +393,33 @@ class YouTubeDownloaderApp:
 		worker.start()
 
 	def _search_worker(self, query: str, max_results: int, append: bool, known_ids) -> None:
-		options = {
+		base_options = {
 			"quiet": True,
 			"no_warnings": True,
 			"extract_flat": True,
 			"skip_download": True,
 		}
 		try:
-			with yt_dlp.YoutubeDL(options) as ydl:
-				info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+			search_query = f"ytsearch{max_results}:{query}"
+			info = None
+			for use_insecure in (False, True):
+				options = dict(base_options)
+				if use_insecure:
+					options["nocheckcertificate"] = True
+				try:
+					with yt_dlp.YoutubeDL(options) as ydl:
+						info = ydl.extract_info(search_query, download=False)
+					break
+				except Exception as exc:
+					if not use_insecure and self._is_ssl_certificate_error(exc):
+						self.output_queue.put(
+							(
+								"log",
+								"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+							)
+						)
+						continue
+					raise
 			entries = info.get("entries", []) if info else []
 			parsed = []
 			for item in entries:
@@ -467,9 +520,16 @@ class YouTubeDownloaderApp:
 		elif getattr(event, "num", None) == 5:
 			delta_units = 1
 		else:
-			# Windows/modern Tk: positive delta when wheel up, negative when down.
+			# macOS often sends small deltas (e.g. +/-1 or +/-2), while Windows sends multiples of 120.
 			delta = int(getattr(event, "delta", 0))
-			delta_units = -int(delta / 120) if delta else 0
+			if not delta:
+				delta_units = 0
+			elif sys.platform == "darwin":
+				delta_units = -1 if delta > 0 else 1
+			elif abs(delta) < 120:
+				delta_units = -1 if delta > 0 else 1
+			else:
+				delta_units = -int(delta / 120)
 		if delta_units:
 			self.results_canvas.yview_scroll(delta_units, "units")
 		return "break"
@@ -554,6 +614,7 @@ class YouTubeDownloaderApp:
 				row,
 				text=item.get("title") or "Sin titulo",
 				bg="#ffffff",
+				fg="#000000",
 				anchor="w",
 				justify="left",
 				wraplength=self.col_title_px - 8,
@@ -573,10 +634,10 @@ class YouTubeDownloaderApp:
 			)
 			url_lbl.grid(row=1, column=2, sticky="ew", pady=(0, 4))
 
-			duration_lbl = tk.Label(row, text=item["duration"], bg="#ffffff", anchor="center", width=10)
+			duration_lbl = tk.Label(row, text=item["duration"], bg="#ffffff", fg="#000000", anchor="center", width=10)
 			duration_lbl.grid(row=0, column=3, rowspan=2, sticky="n", pady=(18, 0), padx=(0, 6))
 
-			channel_lbl = tk.Label(row, text=item["channel"], bg="#ffffff", anchor="w")
+			channel_lbl = tk.Label(row, text=item["channel"], bg="#ffffff", fg="#000000", anchor="w")
 			channel_lbl.grid(row=0, column=4, rowspan=2, sticky="w", padx=(6, 6))
 
 			for widget in (row, thumb_lbl, title_lbl, duration_lbl, channel_lbl):
@@ -630,6 +691,7 @@ class YouTubeDownloaderApp:
 				row,
 				text=item.get("title") or "Sin titulo",
 				bg="#ffffff",
+				fg="#000000",
 				anchor="w",
 				justify="left",
 				wraplength=self.col_title_px - 8,
@@ -649,10 +711,10 @@ class YouTubeDownloaderApp:
 			)
 			url_lbl.grid(row=1, column=2, sticky="ew", pady=(0, 4))
 
-			duration_lbl = tk.Label(row, text=item["duration"], bg="#ffffff", anchor="center", width=10)
+			duration_lbl = tk.Label(row, text=item["duration"], bg="#ffffff", fg="#000000", anchor="center", width=10)
 			duration_lbl.grid(row=0, column=3, rowspan=2, sticky="n", pady=(18, 0), padx=(0, 6))
 
-			channel_lbl = tk.Label(row, text=item["channel"], bg="#ffffff", anchor="w")
+			channel_lbl = tk.Label(row, text=item["channel"], bg="#ffffff", fg="#000000", anchor="w")
 			channel_lbl.grid(row=0, column=4, rowspan=2, sticky="w", padx=(6, 6))
 
 			for widget in (row, thumb_lbl, title_lbl, duration_lbl, channel_lbl):
@@ -683,9 +745,16 @@ class YouTubeDownloaderApp:
 			if not thumb_url:
 				continue
 			try:
-				with urlopen(thumb_url, timeout=12) as response:
-					thumb_data = response.read()
-				self.output_queue.put(("thumbnail", (idx + idx_offset, thumb_data)))
+				if self.ca_bundle_path:
+					ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
+					with urlopen(thumb_url, timeout=12, context=ssl_context) as response:
+						thumb_data = response.read()
+				else:
+					with urlopen(thumb_url, timeout=12) as response:
+						thumb_data = response.read()
+				
+				if thumb_data:
+					self.output_queue.put(("thumbnail", (idx + idx_offset, thumb_data)))
 			except Exception:
 				continue
 
@@ -779,7 +848,7 @@ class YouTubeDownloaderApp:
 			"best[height=1080][ext=mp4]/best[height<=1080][ext=mp4]"
 		)
 
-		options = {
+		base_options = {
 			"format": format_selector,
 			"outtmpl": os.path.join(folder, "%(title).200B.%(ext)s"),
 			"noplaylist": True,
@@ -795,11 +864,27 @@ class YouTubeDownloaderApp:
 		}
 
 		try:
-			with yt_dlp.YoutubeDL(options) as ydl:
-				for i, url in enumerate(urls):
-					current_index["value"] = i
-					self.output_queue.put(("log", f"Descargando ({i + 1}/{total}): {url}"))
-					ydl.download([url])
+			for use_insecure in (False, True):
+				options = dict(base_options)
+				if use_insecure:
+					options["nocheckcertificate"] = True
+				try:
+					with yt_dlp.YoutubeDL(options) as ydl:
+						for i, url in enumerate(urls):
+							current_index["value"] = i
+							self.output_queue.put(("log", f"Descargando ({i + 1}/{total}): {url}"))
+							ydl.download([url])
+					break
+				except Exception as exc:
+					if not use_insecure and self._is_ssl_certificate_error(exc):
+						self.output_queue.put(
+							(
+								"log",
+								"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+							)
+						)
+						continue
+					raise
 			self.output_queue.put(("progress", 100))
 			self.output_queue.put(("download_done", None))
 		except Exception as exc:  # pragma: no cover - depends on network/runtime
