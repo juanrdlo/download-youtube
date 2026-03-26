@@ -2,6 +2,7 @@ import os
 import queue
 import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -10,6 +11,7 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 
@@ -17,11 +19,6 @@ try:
 	import yt_dlp
 except ImportError:  # pragma: no cover - handled at runtime for user guidance
 	yt_dlp = None
-
-try:
-	import vlc
-except Exception:
-	vlc = None
 
 try:
 	import imageio_ffmpeg
@@ -32,6 +29,11 @@ try:
 	import certifi
 except ImportError:  # pragma: no cover - optional dependency
 	certifi = None
+
+try:
+	import webview
+except ImportError:  # pragma: no cover - optional dependency
+	webview = None
 
 try:
 	from PIL import Image, ImageTk
@@ -72,6 +74,7 @@ class YouTubeDownloaderApp:
 		self.search_mode = tk.StringVar(value="normal")  # "normal" o "playlist"
 		self.last_placeholder = "Buscar videos..."  # guardar el placeholder anterior
 		self.search_mode.trace_add("write", lambda *args: self._update_search_placeholder())
+		self.download_format_var = tk.StringVar(value="mp4")
 
 		self._build_ui()
 		self._poll_queue()
@@ -94,6 +97,8 @@ class YouTubeDownloaderApp:
 			self._log(f"ffmpeg detectado: {self.ffmpeg_location}")
 		else:
 			self._log("ffmpeg no detectado: para mejor opcion 1080p instala ffmpeg o imageio-ffmpeg.")
+		if webview is None:
+			self._log("Sugerencia: instala pywebview para reproductor embebido (pip install pywebview).")
 
 	def _configure_ssl_certificates(self) -> Optional[str]:
 		if certifi is None:
@@ -319,12 +324,30 @@ class YouTubeDownloaderApp:
 		)
 		self.download_btn.grid(row=1, column=0, sticky="w")
 
+		format_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+		format_frame.grid(row=1, column=1, sticky="w", padx=(12, 8))
+		ctk.CTkLabel(format_frame, text="Formato:").pack(side="left", padx=(0, 8))
+		self.format_mp4_rb = ctk.CTkRadioButton(
+			format_frame,
+			text="MP4",
+			variable=self.download_format_var,
+			value="mp4",
+		)
+		self.format_mp4_rb.pack(side="left", padx=(0, 8))
+		self.format_mp3_rb = ctk.CTkRadioButton(
+			format_frame,
+			text="MP3",
+			variable=self.download_format_var,
+			value="mp3",
+		)
+		self.format_mp3_rb.pack(side="left")
+
 		self.status_var = tk.StringVar(value="Listo")
-		ctk.CTkLabel(bottom_frame, textvariable=self.status_var).grid(row=1, column=1, padx=12, sticky="w")
+		ctk.CTkLabel(bottom_frame, textvariable=self.status_var).grid(row=1, column=2, padx=12, sticky="w")
 
 		self.progress = ttk.Progressbar(bottom_frame, mode="determinate", maximum=100)
-		self.progress.grid(row=1, column=2, sticky="ew")
-		bottom_frame.columnconfigure(2, weight=1)
+		self.progress.grid(row=1, column=3, sticky="ew")
+		bottom_frame.columnconfigure(3, weight=1)
 
 		self.log_text = ctk.CTkTextbox(self.root, height=160, wrap="word")
 		self.log_text.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -335,7 +358,14 @@ class YouTubeDownloaderApp:
 			self.placeholder_thumb = ctk.CTkImage(placeholder, size=(100, 60))
 
 	def _set_controls_state(self, state: str) -> None:
-		for widget in (self.query_entry, self.search_btn, self.max_results_spin, self.download_btn):
+		for widget in (
+			self.query_entry,
+			self.search_btn,
+			self.max_results_spin,
+			self.download_btn,
+			self.format_mp4_rb,
+			self.format_mp3_rb,
+		):
 			widget.configure(state=state)
 		if self.load_more_btn is not None:
 			self.load_more_btn.configure(state=state)
@@ -652,204 +682,25 @@ class YouTubeDownloaderApp:
 		if 0 <= idx < len(self.results):
 			url = self.results[idx].get("url")
 			if url:
-				self._open_video_popup(url, self.results[idx].get("title") or "Video")
+				title = self.results[idx].get("title") or "Video"
+				self._open_video_in_webview(url, title)
 		return "break"
 
-	def _open_video_popup(self, url: str, title: str) -> None:
-		if vlc is None:
+	def _open_video_in_webview(self, url: str, title: str) -> None:
+		cmd = []
+		if getattr(sys, "frozen", False):
+			cmd = [sys.executable, "--webview-player", url, title]
+		else:
+			cmd = [sys.executable, os.path.abspath(__file__), "--webview-player", url, title]
+		try:
+			subprocess.Popen(cmd)
+		except Exception as exc:
 			messagebox.showwarning(
 				"Reproductor no disponible",
-				"No se pudo cargar VLC embebido. Se abrira en el navegador.",
+				f"No se pudo abrir el reproductor embebido ({exc}). Se abrira en navegador.",
 			)
 			webbrowser.open_new_tab(url)
-			return
 
-		popup = tk.Toplevel(self.root)
-		popup.title(f"Reproduciendo: {title[:70]}")
-		popup.geometry("450x350")
-		popup.minsize(450, 350)
-
-		video_frame = tk.Frame(popup, bg="#000000")
-		video_frame.pack(fill="both", expand=True)
-
-		controls = ttk.Frame(popup)
-		controls.pack(fill="x")
-
-		status_var = tk.StringVar(value="Preparando reproduccion...")
-		ttk.Label(controls, textvariable=status_var).pack(side="left", padx=8, pady=6)
-
-		progress_var = tk.DoubleVar(value=0.0)
-		progress_scale = ttk.Scale(controls, from_=0, to=1000, orient="horizontal", variable=progress_var)
-		progress_scale.pack(side="left", fill="x", expand=True, padx=(6, 8), pady=6)
-		progress_scale.configure(state="disabled")
-
-		instance = vlc.Instance(
-			"--no-video-title-show",
-			"--avcodec-hw=none",
-			"--quiet",
-			"--verbose=0",
-		)
-		player = instance.media_player_new()
-		is_dragging = {"value": False}
-
-		popup.update_idletasks()
-		handle = video_frame.winfo_id()
-		player.set_hwnd(handle)
-
-		def start_playback(target_url: str) -> None:
-			try:
-				player.set_mrl(target_url)
-				player.play()
-				status_var.set("Reproduciendo")
-				pause_btn.configure(text="Pausar")
-				progress_scale.configure(state="normal")
-			except Exception as exc:
-				status_var.set("No se pudo reproducir")
-				messagebox.showerror("Error de reproduccion", str(exc))
-
-		def play_now() -> None:
-			try:
-				state = player.get_state()
-				if state in (vlc.State.Paused, vlc.State.Stopped, vlc.State.Ended):
-					player.play()
-				status_var.set("Reproduciendo")
-				pause_btn.configure(text="Pausar")
-			except Exception as exc:
-				status_var.set("Error al reproducir")
-				messagebox.showerror("Error de reproduccion", str(exc))
-
-		def restart_from_beginning() -> None:
-			try:
-				player.set_time(0)
-				player.play()
-				pause_btn.configure(text="Pausar")
-				status_var.set("Reiniciado")
-			except Exception as exc:
-				status_var.set("Error al reiniciar")
-				messagebox.showerror("Error de reproduccion", str(exc))
-
-		def toggle_pause() -> None:
-			try:
-				state = player.get_state()
-				if state == vlc.State.Playing:
-					player.pause()
-					pause_btn.configure(text="Reanudar")
-					status_var.set("En pausa")
-				elif state == vlc.State.Paused:
-					player.pause()
-					pause_btn.configure(text="Pausar")
-					status_var.set("Reproduciendo")
-				else:
-					player.play()
-					pause_btn.configure(text="Pausar")
-					status_var.set("Reproduciendo")
-			except Exception as exc:
-				status_var.set("Error al pausar/reanudar")
-				messagebox.showerror("Error de reproduccion", str(exc))
-
-		def _resolve_stream_url(video_url: str) -> str:
-			if yt_dlp is None:
-				return video_url
-			opts = {
-				"quiet": True,
-				"no_warnings": True,
-				"skip_download": True,
-				"noplaylist": True,
-				"format": (
-					"best[ext=mp4][vcodec!=none][acodec!=none][height<=1080]"
-					"/best[ext=mp4][height<=1080]"
-					"/best[height<=1080]"
-					"/best"
-				),
-			}
-			try:
-				with yt_dlp.YoutubeDL(opts) as ydl:
-					info = ydl.extract_info(video_url, download=False)
-				if not info:
-					return video_url
-				if info.get("url"):
-					return info["url"]
-				formats = info.get("formats") or []
-				if formats:
-					preferred = None
-					for fmt in reversed(formats):
-						if fmt.get("url") and (fmt.get("vcodec") != "none" or fmt.get("acodec") != "none"):
-							preferred = fmt
-							break
-					if preferred and preferred.get("url"):
-						return preferred["url"]
-			except Exception:
-				return video_url
-			return video_url
-
-		def resolve_and_play() -> None:
-			status_var.set("Resolviendo stream directo...")
-			stream_url = _resolve_stream_url(url)
-			if not popup.winfo_exists():
-				return
-			popup.after(0, lambda: start_playback(stream_url))
-
-		def _on_seek_press(_event=None):
-			is_dragging["value"] = True
-
-		def _on_seek_release(_event=None):
-			is_dragging["value"] = False
-			try:
-				length_ms = player.get_length()
-				if length_ms and length_ms > 0:
-					target_ms = int((progress_var.get() / 1000.0) * length_ms)
-					player.set_time(target_ms)
-			except Exception:
-				pass
-
-		def _on_seek_move(value):
-			if not is_dragging["value"]:
-				return
-			try:
-				length_ms = player.get_length()
-				if length_ms and length_ms > 0:
-					target_ms = int((float(value) / 1000.0) * length_ms)
-					player.set_time(target_ms)
-			except Exception:
-				pass
-
-		def _update_progress_loop() -> None:
-			if not popup.winfo_exists():
-				return
-			try:
-				length_ms = player.get_length()
-				current_ms = player.get_time()
-				if length_ms and length_ms > 0 and current_ms >= 0 and not is_dragging["value"]:
-					pos = (current_ms / length_ms) * 1000.0
-					progress_var.set(max(0.0, min(1000.0, pos)))
-			except Exception:
-				pass
-			popup.after(250, _update_progress_loop)
-
-		def stop_and_close() -> None:
-			try:
-				player.stop()
-			except Exception:
-				pass
-			popup.destroy()
-
-		play_btn = ttk.Button(controls, text="Play", command=play_now)
-		play_btn.pack(side="right", padx=(0, 6))
-		pause_btn = ttk.Button(controls, text="Pausar", command=toggle_pause)
-		pause_btn.pack(side="right", padx=(0, 6))
-		ttk.Button(controls, text="Reiniciar", command=restart_from_beginning).pack(side="right", padx=(0, 6))
-		ttk.Button(controls, text="Abrir en navegador", command=lambda: webbrowser.open_new_tab(url)).pack(
-			side="right", padx=8
-		)
-		ttk.Button(controls, text="Cerrar", command=stop_and_close).pack(side="right")
-
-		progress_scale.configure(command=_on_seek_move)
-		progress_scale.bind("<ButtonPress-1>", _on_seek_press)
-		progress_scale.bind("<ButtonRelease-1>", _on_seek_release)
-
-		popup.protocol("WM_DELETE_WINDOW", stop_and_close)
-		popup.after(250, _update_progress_loop)
-		threading.Thread(target=resolve_and_play, daemon=True).start()
 	def _render_results(self, results) -> None:
 		self._clear_results()
 		self.results = list(results)
@@ -1099,17 +950,22 @@ class YouTubeDownloaderApp:
 			return
 
 		self.downloading = True
+		download_format = self.download_format_var.get().strip().lower()
+		if download_format not in ("mp3", "mp4"):
+			download_format = "mp4"
 		self.progress.stop()
 		self.progress.configure(mode="determinate", maximum=100)
 		self.progress["value"] = 0
-		self.status_var.set("Descargando...")
+		self.status_var.set(f"Descargando ({download_format.upper()})...")
 		self._set_controls_state("disabled")
-		self._log(f"Iniciando descarga de {len(urls)} video(s) en: {folder}")
+		self._log(
+			f"Iniciando descarga de {len(urls)} elemento(s) en formato {download_format.upper()} en: {folder}"
+		)
 
-		worker = threading.Thread(target=self._download_worker, args=(urls, folder), daemon=True)
+		worker = threading.Thread(target=self._download_worker, args=(urls, folder, download_format), daemon=True)
 		worker.start()
 
-	def _download_worker(self, urls, folder: str) -> None:
+	def _download_worker(self, urls, folder: str, output_format: str) -> None:
 		total = len(urls)
 		current_index = {"value": 0}
 		has_ffmpeg = self.ffmpeg_location is not None
@@ -1117,7 +973,7 @@ class YouTubeDownloaderApp:
 			self.output_queue.put(
 				(
 					"error",
-					"No se encontro ffmpeg. Para salida MP4 compatible (audio AAC) instala ffmpeg o imageio-ffmpeg.",
+					"No se encontro ffmpeg. Instala ffmpeg o imageio-ffmpeg para convertir/combinar audio y video.",
 				)
 			)
 			return
@@ -1133,29 +989,47 @@ class YouTubeDownloaderApp:
 			elif status == "finished":
 				self.output_queue.put(("log", f"Completado: {os.path.basename(data.get('filename', 'archivo'))}"))
 
-		# Prioriza 1080p exacto y codecs compatibles con Windows (H264/AAC) en contenedor MP4.
-		format_selector = (
-			"bestvideo[height=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-			"bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-			"bestvideo[height=1080]+bestaudio/"
-			"bestvideo[height<=1080]+bestaudio/"
-			"best[height=1080][ext=mp4]/best[height<=1080][ext=mp4]"
-		)
-
 		base_options = {
-			"format": format_selector,
 			"outtmpl": os.path.join(folder, "%(title).200B.%(ext)s"),
 			"noplaylist": True,
 			"progress_hooks": [progress_hook],
 			"quiet": True,
 			"no_warnings": True,
 			"retries": 5,
-			"merge_output_format": "mp4",
 			"ffmpeg_location": self.ffmpeg_location,
-			"postprocessor_args": {
-				"Merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
-			},
 		}
+
+		if output_format == "mp3":
+			base_options.update(
+				{
+					"format": "bestaudio/best",
+					"postprocessors": [
+						{
+							"key": "FFmpegExtractAudio",
+							"preferredcodec": "mp3",
+							"preferredquality": "320",
+						}
+					],
+				}
+			)
+		else:
+			# Prioriza 1080p y codecs compatibles en contenedor MP4.
+			format_selector = (
+				"bestvideo[height=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+				"bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+				"bestvideo[height=1080]+bestaudio/"
+				"bestvideo[height<=1080]+bestaudio/"
+				"best[height=1080][ext=mp4]/best[height<=1080][ext=mp4]"
+			)
+			base_options.update(
+				{
+					"format": format_selector,
+					"merge_output_format": "mp4",
+					"postprocessor_args": {
+						"Merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+					},
+				}
+			)
 
 		try:
 			for use_insecure in (False, True):
@@ -1254,5 +1128,49 @@ def main() -> None:
 			pass
 
 
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+	parsed = urlparse(url)
+	host = parsed.netloc.lower()
+	path = parsed.path.strip("/")
+
+	if "youtu.be" in host:
+		return path.split("/")[0] if path else None
+	if "youtube.com" in host:
+		if parsed.path == "/watch":
+			return parse_qs(parsed.query).get("v", [None])[0]
+		if parsed.path.startswith("/shorts/"):
+			return path.split("/")[1] if len(path.split("/")) > 1 else None
+		if parsed.path.startswith("/embed/"):
+			return path.split("/")[1] if len(path.split("/")) > 1 else None
+	return None
+
+
+def _normalize_youtube_watch_url(url: str) -> str:
+	v_id = _extract_youtube_video_id(url)
+	if not v_id:
+		return url
+	return f"https://www.youtube.com/watch?v={v_id}"
+
+
+def run_webview_player(url: str, title: str) -> int:
+	if not url:
+		return 1
+	normalized_url = _normalize_youtube_watch_url(url)
+	if webview is None:
+		webbrowser.open_new_tab(normalized_url)
+		return 0
+	window_title = f"Reproduciendo: {title[:70]}" if title else "Reproduciendo"
+	try:
+		webview.create_window(window_title, url=normalized_url, width=980, height=620)
+		webview.start()
+	except Exception:
+		webbrowser.open_new_tab(normalized_url)
+	return 0
+
+
 if __name__ == "__main__":
+	if len(sys.argv) > 1 and sys.argv[1] == "--webview-player":
+		url_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+		title_arg = sys.argv[3] if len(sys.argv) > 3 else "Video"
+		raise SystemExit(run_webview_player(url_arg, title_arg))
 	main()
