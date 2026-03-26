@@ -69,6 +69,9 @@ class YouTubeDownloaderApp:
 		self.placeholder_thumb = None
 		self.ffmpeg_location = self._resolve_ffmpeg_location()
 		self.ca_bundle_path = self._configure_ssl_certificates()
+		self.search_mode = tk.StringVar(value="normal")  # "normal" o "playlist"
+		self.last_placeholder = "Buscar videos..."  # guardar el placeholder anterior
+		self.search_mode.trace_add("write", lambda *args: self._update_search_placeholder())
 
 		self._build_ui()
 		self._poll_queue()
@@ -135,14 +138,30 @@ class YouTubeDownloaderApp:
 		top_frame.columnconfigure(1, weight=1)
 		top_frame.grid_columnconfigure(0, weight=0)
 
-		ctk.CTkLabel(top_frame, text="Buscar:").grid(row=0, column=0, padx=(0, 8), sticky="w")
+		# Radio buttons para seleccionar tipo de busqueda
+		mode_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
+		mode_frame.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+		ctk.CTkLabel(mode_frame, text="Tipo de busqueda:").pack(side="left", padx=(0, 8))
+		ctk.CTkRadioButton(
+			mode_frame,
+			text="Busqueda Normal",
+			variable=self.search_mode,
+			value="normal"
+		).pack(side="left", padx=(0, 12))
+		ctk.CTkRadioButton(
+			mode_frame,
+			text="Playlist",
+			variable=self.search_mode,
+			value="playlist"
+		).pack(side="left", padx=(0, 0))
+
 		self.search_input_frame = ctk.CTkFrame(
 			top_frame,
 			fg_color="#FFFFFF",
 			border_width=0.5,
 			border_color="#D0D7DE",
 		)
-		self.search_input_frame.grid(row=0, column=1, sticky="ew")
+		self.search_input_frame.grid(row=1, column=1, sticky="ew")
 		self.search_icon = ctk.CTkLabel(
 			self.search_input_frame,
 			text="\U0001F50D",
@@ -159,8 +178,9 @@ class YouTubeDownloaderApp:
 			placeholder_text="Buscar videos...",
 		)
 		self.query_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
+		self._update_search_placeholder()
 		self.search_underline = ctk.CTkFrame(top_frame, height=2, fg_color="#D0D7DE")
-		self.search_underline.grid(row=1, column=1, sticky="ew")
+		self.search_underline.grid(row=2, column=1, sticky="ew")
 		self.query_entry.bind("<Return>", lambda _e: self.search_videos())
 		self.query_entry.bind("<FocusIn>", self._on_search_focus_in)
 		self.query_entry.bind("<FocusOut>", self._on_search_focus_out)
@@ -170,10 +190,10 @@ class YouTubeDownloaderApp:
 			text="Buscar",
 			command=self.search_videos,
 		)
-		self.search_btn.grid(row=0, column=2, padx=(8, 0))
+		self.search_btn.grid(row=1, column=2, padx=(8, 0))
 
 		self.max_results_var = tk.IntVar(value=20)
-		ctk.CTkLabel(top_frame, text="Resultados:").grid(row=0, column=3, padx=(14, 6), sticky="e")
+		ctk.CTkLabel(top_frame, text="Resultados:").grid(row=1, column=3, padx=(14, 6), sticky="e")
 		self.max_results_spin = ttk.Spinbox(
 			top_frame,
 			from_=5,
@@ -181,7 +201,7 @@ class YouTubeDownloaderApp:
 			textvariable=self.max_results_var,
 			width=5,
 		)
-		self.max_results_spin.grid(row=0, column=4, sticky="w")
+		self.max_results_spin.grid(row=1, column=4, sticky="w")
 
 		middle_frame = ctk.CTkFrame(self.root, fg_color="transparent")
 		middle_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 0))
@@ -239,26 +259,46 @@ class YouTubeDownloaderApp:
 
 		selected_frame = ctk.CTkFrame(middle_frame, fg_color="transparent")
 		selected_frame.grid(row=0, column=1, sticky="nsew")
-		selected_frame.rowconfigure(1, weight=1)
+		selected_frame.rowconfigure(2, weight=1)
 		selected_frame.columnconfigure(0, weight=1)
 
+		header_frame = ctk.CTkFrame(selected_frame, fg_color="transparent")
+		header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+		header_frame.columnconfigure(0, weight=1)
+
 		self.selected_count_var = tk.StringVar(value="Seleccionados: 0")
-		ctk.CTkLabel(selected_frame, textvariable=self.selected_count_var).grid(row=0, column=0, sticky="w")
+		ctk.CTkLabel(header_frame, textvariable=self.selected_count_var).grid(row=0, column=0, sticky="w")
+
+		buttons_frame = ctk.CTkFrame(selected_frame, fg_color="transparent")
+		buttons_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+		buttons_frame.columnconfigure(1, weight=1)
+
+		ctk.CTkButton(
+			buttons_frame,
+			text="Seleccionar todos",
+			command=self._select_all,
+			width=110,
+			height=24,
+		).grid(row=0, column=0, padx=(0, 4))
+
+		ctk.CTkButton(
+			buttons_frame,
+			text="Deseleccionar todos",
+			command=self._deselect_all,
+			width=110,
+			height=24,
+		).grid(row=0, column=1, sticky="w")
 
 		self.selected_text = ctk.CTkTextbox(
 			selected_frame,
 			width=250,
-			font=("Segoe UI", 8),
+			font=("Segoe UI", 12),
 			height=18,
 			wrap="word",
 			cursor="arrow",
 		)
-		self.selected_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+		self.selected_text.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
 		self.selected_text.configure(state="disabled")
-
-		selected_scroll = ctk.CTkScrollbar(selected_frame, orientation="vertical", command=self.selected_text.yview)
-		selected_scroll.grid(row=1, column=1, sticky="ns", pady=(6, 0))
-		self.selected_text.configure(yscrollcommand=selected_scroll.set)
 
 		bottom_frame = ctk.CTkFrame(self.root, fg_color="transparent")
 		bottom_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
@@ -290,9 +330,9 @@ class YouTubeDownloaderApp:
 		self.log_text.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
 		self.log_text.configure(state="disabled")
 		self.root.rowconfigure(3, weight=0)
-		if Image is not None and ImageTk is not None:
+		if Image is not None:
 			placeholder = Image.new("RGB", (100, 60), color="#202020")
-			self.placeholder_thumb = ImageTk.PhotoImage(placeholder)
+			self.placeholder_thumb = ctk.CTkImage(placeholder, size=(100, 60))
 
 	def _set_controls_state(self, state: str) -> None:
 		for widget in (self.query_entry, self.search_btn, self.max_results_spin, self.download_btn):
@@ -314,6 +354,25 @@ class YouTubeDownloaderApp:
 		self.progress.stop()
 		self.progress.configure(mode="determinate", maximum=100)
 		self.progress["value"] = 0
+
+	def _update_search_placeholder(self) -> None:
+		if not hasattr(self, 'query_entry'):
+			return
+
+		is_playlist_mode = self.search_mode.get() == "playlist"
+		new_placeholder = "Colocar URL de Playlist" if is_playlist_mode else "Buscar videos..."
+
+		# Al cambiar el modo, dejar el input en estado inicial (vacío + placeholder).
+		self.query_entry.delete(0, "end")
+
+		# Actualizar el placeholder
+		self.query_entry.configure(placeholder_text=new_placeholder)
+		self.last_placeholder = new_placeholder
+
+		# Deshabilitar max_results_spin en modo playlist
+		if hasattr(self, 'max_results_spin'):
+			state = "disabled" if is_playlist_mode else "normal"
+			self.max_results_spin.configure(state=state)
 
 	def _log(self, message: str) -> None:
 		self.log_text.configure(state="normal")
@@ -366,14 +425,15 @@ class YouTubeDownloaderApp:
 		self._clear_results()
 		self._start_search_loading()
 
+		search_mode = self.search_mode.get()
 		worker = threading.Thread(
 			target=self._search_worker,
-			args=(query, max_results, False, set()),
+			args=(query, max_results, False, set(), search_mode),
 			daemon=True,
 		)
 		worker.start()
 
-	def _search_worker(self, query: str, max_results: int, append: bool, known_ids) -> None:
+	def _search_worker(self, query: str, max_results: int, append: bool, known_ids, search_mode: str = "normal") -> None:
 		base_options = {
 			"quiet": True,
 			"no_warnings": True,
@@ -381,7 +441,16 @@ class YouTubeDownloaderApp:
 			"skip_download": True,
 		}
 		try:
-			search_query = f"ytsearch{max_results}:{query}"
+			if search_mode == "playlist":
+				# Si es una URL de playlist, usarla directamente
+				if query.startswith("http://") or query.startswith("https://"):
+					search_query = query
+					base_options["noplaylist"] = False
+				else:
+					# Si no es URL, buscar por nombre de playlist
+					search_query = f"ytplaylist{max_results}:{query}"
+			else:
+				search_query = f"ytsearch{max_results}:{query}"
 			info = None
 			for use_insecure in (False, True):
 				options = dict(base_options)
@@ -482,9 +551,10 @@ class YouTubeDownloaderApp:
 			self.load_more_btn.configure(state="disabled", text="Cargando...")
 		known_ids = {item.get("id") for item in self.results if item.get("id")}
 		next_limit = self.current_limit + self.page_step
+		search_mode = self.search_mode.get()
 		worker = threading.Thread(
 			target=self._search_worker,
-			args=(self.current_query, next_limit, True, known_ids),
+			args=(self.current_query, next_limit, True, known_ids, search_mode),
 			daemon=True,
 		)
 		worker.start()
@@ -514,6 +584,25 @@ class YouTubeDownloaderApp:
 		if delta_units:
 			self.results_canvas.yview_scroll(delta_units, "units")
 		return "break"
+
+	def _select_all(self) -> None:
+		if not self.results:
+			return
+		for idx in range(len(self.results)):
+			iid = str(idx)
+			self.checked_items.add(iid)
+			widgets = self.row_widgets.get(iid)
+			if widgets and widgets.get("check_var"):
+				widgets["check_var"].set(True)
+		self._refresh_selected_panel()
+
+	def _deselect_all(self) -> None:
+		for iid in list(self.checked_items):
+			widgets = self.row_widgets.get(iid)
+			if widgets and widgets.get("check_var"):
+				widgets["check_var"].set(False)
+		self.checked_items.clear()
+		self._refresh_selected_panel()
 
 	def _refresh_selected_panel(self) -> None:
 		self.selected_text.configure(state="normal")
@@ -978,10 +1067,9 @@ class YouTubeDownloaderApp:
 			offset_x = (100 - image.width) // 2
 			offset_y = (60 - image.height) // 2
 			canvas.paste(image, (offset_x, offset_y))
-			thumb_photo = ImageTk.PhotoImage(canvas)
+			thumb_photo = ctk.CTkImage(canvas, size=(100, 60))
 			self.thumbnail_images[iid] = thumb_photo
 			widgets["thumb"].configure(image=thumb_photo)
-			widgets["thumb"].image = thumb_photo
 		except Exception:
 			return
 
