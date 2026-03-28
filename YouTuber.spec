@@ -1,19 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-
-datas = []
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('webview')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['youtuber.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=[],
+    datas=[],
+    hiddenimports=['customtkinter', 'darkdetect'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,8 +19,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name='YouTuber',
     debug=False,
     bootloader_ignore_signals=False,
@@ -40,18 +35,10 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='YouTuber',
-)
+
 app = BUNDLE(
-    coll,
+    exe,
     name='YouTuber.app',
     icon=None,
-    bundle_identifier=None,
+    bundle_identifier='com.juanrdlo.youtuber',
 )

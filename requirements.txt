@@ -1,0 +1,7 @@
+yt-dlp
+customtkinter
+pillow
+imageio-ffmpeg
+certifi
+pywebview
+pyinstaller
