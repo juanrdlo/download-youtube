@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>YouTuber</string>
+	<string>youtuber</string>
 	<key>CFBundleExecutable</key>
-	<string>YouTuber</string>
+	<string>youtuber</string>
 	<key>CFBundleIconFile</key>
 	<string>icon-windowed.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.juanrdlo.youtuber</string>
+	<string>youtuber</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>YouTuber</string>
+	<string>youtuber</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
