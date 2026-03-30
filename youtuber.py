@@ -9,7 +9,7 @@ import webbrowser
 from io import BytesIO
 from typing import Optional
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import customtkinter as ctk
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -71,10 +71,19 @@ class YouTubeDownloaderApp:
 		self.placeholder_thumb = None
 		self.ffmpeg_location = self._resolve_ffmpeg_location()
 		self.ca_bundle_path = self._configure_ssl_certificates()
+		self.last_download_folder = os.path.expanduser("~")
 		self.search_mode = tk.StringVar(value="normal")  # "normal" o "playlist"
 		self.last_placeholder = "Buscar videos..."  # guardar el placeholder anterior
 		self.search_mode.trace_add("write", lambda *args: self._update_search_placeholder())
 		self.download_format_var = tk.StringVar(value="mp4")
+		self.render_batch_size = 40
+		self.max_thumbnail_jobs = 250
+		self.render_generation = 0
+		self.thumbnail_generation = 0
+		self.thumbnail_limit_logged = False
+		self.row_height = 76
+		self.virtual_buffer_rows = 8
+		self.virtual_after_id = None
 
 		self._build_ui()
 		self._poll_queue()
@@ -248,7 +257,7 @@ class YouTubeDownloaderApp:
 		self.results_canvas.grid(row=0, column=0, sticky="nsew")
 		self.y_scroll = ctk.CTkScrollbar(body, orientation="vertical", command=self.results_canvas.yview)
 		self.y_scroll.grid(row=0, column=1, sticky="ns")
-		self.results_canvas.configure(yscrollcommand=self.y_scroll.set)
+		self.results_canvas.configure(yscrollcommand=self._on_canvas_yscroll)
 
 		self.rows_frame = ctk.CTkFrame(self.results_canvas, fg_color="#ffffff")
 		self.rows_window = self.results_canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
@@ -261,6 +270,7 @@ class YouTubeDownloaderApp:
 		self.rows_frame.bind("<Button-4>", self._on_results_mousewheel)
 		self.rows_frame.bind("<Button-5>", self._on_results_mousewheel)
 		self.row_widgets = {}
+		self.rows_frame.configure(width=1, height=1)
 
 		selected_frame = ctk.CTkFrame(middle_frame, fg_color="transparent")
 		selected_frame.grid(row=0, column=1, sticky="nsew")
@@ -435,6 +445,18 @@ class YouTubeDownloaderApp:
 			return "-"
 		return f"{views:,}".replace(",", ".")
 
+	@staticmethod
+	def _is_unavailable_video_entry(item: dict) -> bool:
+		title = (item.get("title") or "").strip().lower()
+		if title in {"[deleted video]", "deleted video", "[private video]", "private video"}:
+			return True
+		availability = (item.get("availability") or "").strip().lower()
+		if availability in {"private", "unavailable"}:
+			return True
+		if not (item.get("id") or item.get("url") or item.get("webpage_url")):
+			return True
+		return False
+
 	def search_videos(self) -> None:
 		if yt_dlp is None:
 			return
@@ -502,8 +524,14 @@ class YouTubeDownloaderApp:
 					raise
 			entries = info.get("entries", []) if info else []
 			parsed = []
+			skipped_unavailable = 0
+			scanned_count = 0
 			for item in entries:
 				if not item:
+					continue
+				scanned_count += 1
+				if self._is_unavailable_video_entry(item):
+					skipped_unavailable += 1
 					continue
 				video_id = item.get("id")
 				thumbnails = item.get("thumbnails") or []
@@ -523,6 +551,13 @@ class YouTubeDownloaderApp:
 						or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None),
 					}
 				)
+			if skipped_unavailable:
+				self.output_queue.put(
+					(
+						"log",
+						f"Se omitieron {skipped_unavailable} video(s) no disponibles en la busqueda.",
+					)
+				)
 
 			if append:
 				new_items = []
@@ -531,16 +566,25 @@ class YouTubeDownloaderApp:
 					if vid and vid in known_ids:
 						continue
 					new_items.append(video)
-				self.output_queue.put(("search_append_done", (new_items, len(parsed), max_results)))
+				self.output_queue.put(("search_append_done", (new_items, scanned_count, max_results)))
 			else:
-				self.output_queue.put(("search_done", (parsed, len(parsed), query, max_results)))
+				self.output_queue.put(("search_done", (parsed, scanned_count, query, max_results)))
 		except Exception as exc:  # pragma: no cover - depends on network/runtime
 			self.output_queue.put(("error", f"Error de busqueda: {exc}"))
 
 	def _clear_results(self) -> None:
+		self.render_generation += 1
+		self.thumbnail_generation += 1
+		if self.virtual_after_id is not None:
+			try:
+				self.root.after_cancel(self.virtual_after_id)
+			except Exception:
+				pass
+			self.virtual_after_id = None
 		self.results = []
 		self.checked_items.clear()
 		self.thumbnail_images.clear()
+		self.thumbnail_limit_logged = False
 		self.has_more_results = False
 		self.selected_count_var.set("Seleccionados: 0")
 		self.selected_text.configure(state="normal")
@@ -551,15 +595,18 @@ class YouTubeDownloaderApp:
 		self.row_widgets.clear()
 		self.load_more_btn = None
 		self.results_canvas.yview_moveto(0)
+		self._update_virtual_scrollregion()
 
 	def _render_load_more_button(self) -> None:
 		if self.load_more_btn is not None:
 			self.load_more_btn.destroy()
 			self.load_more_btn = None
 		if not self.has_more_results:
+			self._update_virtual_scrollregion()
+			self._schedule_virtual_refresh()
 			return
-		row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0)
-		row.grid(row=len(self.results), column=0, sticky="ew", pady=(8, 12))
+		row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0, width=1, height=44)
+		row.place(x=0, y=len(self.results) * self.row_height + 8, relwidth=1.0)
 		row.columnconfigure(0, weight=1)
 		self.load_more_btn = ctk.CTkButton(
 			row,
@@ -569,6 +616,8 @@ class YouTubeDownloaderApp:
 		self.load_more_btn.grid(row=0, column=0)
 		if self.loading_more:
 			self.load_more_btn.configure(state="disabled")
+		self._update_virtual_scrollregion()
+		self._schedule_virtual_refresh()
 
 	def load_more_results(self) -> None:
 		if yt_dlp is None:
@@ -590,10 +639,69 @@ class YouTubeDownloaderApp:
 		worker.start()
 
 	def _on_rows_frame_configure(self, _event=None) -> None:
-		self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+		self._update_virtual_scrollregion()
 
 	def _on_results_canvas_configure(self, event) -> None:
 		self.results_canvas.itemconfigure(self.rows_window, width=event.width)
+		self.rows_frame.configure(width=event.width)
+		self._update_virtual_scrollregion()
+		self._schedule_virtual_refresh()
+
+	def _on_canvas_yscroll(self, first: str, last: str) -> None:
+		self.y_scroll.set(first, last)
+		self._schedule_virtual_refresh()
+
+	def _update_virtual_scrollregion(self) -> None:
+		canvas_w = max(1, self.results_canvas.winfo_width())
+		button_extra = 56 if self.has_more_results else 0
+		content_height = len(self.results) * self.row_height + button_extra + 8
+		content_height = max(content_height, self.results_canvas.winfo_height(), 1)
+		self.rows_frame.configure(width=canvas_w, height=content_height)
+		self.results_canvas.configure(scrollregion=(0, 0, canvas_w, content_height))
+
+	def _schedule_virtual_refresh(self) -> None:
+		if self.virtual_after_id is not None:
+			return
+		self.virtual_after_id = self.root.after(12, self._refresh_visible_rows)
+
+	def _refresh_visible_rows(self) -> None:
+		self.virtual_after_id = None
+		if not self.results:
+			for iid in list(self.row_widgets):
+				row = self.row_widgets[iid].get("row")
+				if row is not None:
+					row.destroy()
+				self.row_widgets.pop(iid, None)
+			return
+
+		canvas_h = max(1, self.results_canvas.winfo_height())
+		y0 = max(0, self.results_canvas.canvasy(0))
+		y1 = y0 + canvas_h
+		first_idx = max(0, int(y0 // self.row_height) - self.virtual_buffer_rows)
+		last_idx = min(len(self.results) - 1, int(y1 // self.row_height) + self.virtual_buffer_rows)
+
+		desired = {str(i) for i in range(first_idx, last_idx + 1)}
+		for iid in list(self.row_widgets):
+			if iid in desired:
+				continue
+			row = self.row_widgets[iid].get("row")
+			if row is not None:
+				row.destroy()
+			self.row_widgets.pop(iid, None)
+
+		for idx in range(first_idx, last_idx + 1):
+			iid = str(idx)
+			if iid not in self.row_widgets:
+				self._build_result_row(idx, self.results[idx])
+			widgets = self.row_widgets.get(iid)
+			if not widgets:
+				continue
+			row = widgets.get("row")
+			if row is not None:
+				row.place(x=0, y=idx * self.row_height, relwidth=1.0)
+			check_var = widgets.get("check_var")
+			if check_var is not None:
+				check_var.set(iid in self.checked_items)
 
 	def _on_results_mousewheel(self, event):
 		if getattr(event, "num", None) == 4:
@@ -613,6 +721,7 @@ class YouTubeDownloaderApp:
 				delta_units = -int(delta / 120)
 		if delta_units:
 			self.results_canvas.yview_scroll(delta_units, "units")
+			self._schedule_virtual_refresh()
 		return "break"
 
 	def _select_all(self) -> None:
@@ -701,192 +810,144 @@ class YouTubeDownloaderApp:
 			)
 			webbrowser.open_new_tab(url)
 
+	def _build_result_row(self, idx: int, item: dict) -> None:
+		iid = str(idx)
+		row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0, width=1, height=self.row_height)
+		row.place(x=0, y=idx * self.row_height, relwidth=1.0)
+		row.columnconfigure(0, minsize=self.col_check_px, weight=0)
+		row.columnconfigure(1, minsize=self.col_thumb_px, weight=0)
+		row.columnconfigure(2, minsize=self.col_title_px, weight=0)
+		row.columnconfigure(3, minsize=self.col_duration_px, weight=0)
+		row.columnconfigure(4, minsize=self.col_channel_px, weight=1)
+
+		check_var = tk.BooleanVar(value=iid in self.checked_items)
+		check_btn = ctk.CTkCheckBox(
+			row,
+			text="",
+			variable=check_var,
+			command=lambda rid=iid, var=check_var: self._on_checkbutton_toggle(rid, var),
+			width=10,
+		)
+		check_btn.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(4, 2))
+
+		thumb_image = self.thumbnail_images.get(iid) or self.placeholder_thumb
+		thumb_lbl = ctk.CTkLabel(row, image=thumb_image, text="")
+		thumb_lbl.grid(row=0, column=1, rowspan=2, padx=(2, 6), pady=4, sticky="n")
+
+		title_lbl = ctk.CTkLabel(
+			row,
+			text=item.get("title") or "Sin titulo",
+			text_color="#000000",
+			anchor="w",
+			justify="left",
+			wraplength=self.col_title_px - 8,
+			fg_color="transparent",
+		)
+		title_lbl.grid(row=0, column=2, sticky="ew", pady=(4, 0))
+
+		url_text = item.get("url") or ""
+		url_lbl = ctk.CTkLabel(
+			row,
+			text=url_text,
+			text_color="#0b57d0",
+			cursor="hand2",
+			anchor="w",
+			justify="left",
+			wraplength=self.col_title_px - 8,
+			fg_color="transparent",
+		)
+		url_lbl.grid(row=1, column=2, sticky="ew", pady=(0, 4))
+
+		duration_lbl = ctk.CTkLabel(
+			row,
+			text=item["duration"],
+			text_color="#000000",
+			anchor="center",
+			width=80,
+			fg_color="transparent",
+		)
+		duration_lbl.grid(row=0, column=3, rowspan=2, sticky="n", pady=(18, 0), padx=(0, 6))
+
+		channel_lbl = ctk.CTkLabel(
+			row,
+			text=item["channel"],
+			text_color="#000000",
+			anchor="w",
+			fg_color="transparent",
+		)
+		channel_lbl.grid(row=0, column=4, rowspan=2, sticky="w", padx=(6, 6))
+
+		for widget in (row, thumb_lbl, title_lbl, duration_lbl, channel_lbl):
+			widget.bind("<Button-1>", lambda e, rid=iid: self._on_row_click_toggle(rid, e))
+			widget.bind("<MouseWheel>", self._on_results_mousewheel)
+			widget.bind("<Button-4>", self._on_results_mousewheel)
+			widget.bind("<Button-5>", self._on_results_mousewheel)
+		url_lbl.bind("<Button-1>", lambda e, rid=iid: self._on_url_click(rid, e))
+		url_lbl.bind("<MouseWheel>", self._on_results_mousewheel)
+		url_lbl.bind("<Button-4>", self._on_results_mousewheel)
+		url_lbl.bind("<Button-5>", self._on_results_mousewheel)
+		check_btn.bind("<MouseWheel>", self._on_results_mousewheel)
+		check_btn.bind("<Button-4>", self._on_results_mousewheel)
+		check_btn.bind("<Button-5>", self._on_results_mousewheel)
+
+		self.row_widgets[iid] = {
+			"row": row,
+			"check": check_btn,
+			"check_var": check_var,
+			"thumb": thumb_lbl,
+		}
+
+	def _start_thumbnail_loading(self, results, idx_offset: int = 0) -> None:
+		if Image is None or ImageTk is None or not results:
+			return
+		remaining = self.max_thumbnail_jobs - len(self.thumbnail_images)
+		if remaining <= 0:
+			if not self.thumbnail_limit_logged:
+				self._log(
+					f"Miniaturas limitadas a {self.max_thumbnail_jobs} para mantener fluida la interfaz."
+				)
+				self.thumbnail_limit_logged = True
+			return
+		chunk = results[:remaining]
+		if len(chunk) < len(results) and not self.thumbnail_limit_logged:
+			self._log(
+				f"Miniaturas limitadas a {self.max_thumbnail_jobs} para mantener fluida la interfaz."
+			)
+			self.thumbnail_limit_logged = True
+		generation = self.thumbnail_generation
+		threading.Thread(
+			target=self._thumbnail_worker,
+			args=(chunk, idx_offset, generation),
+			daemon=True,
+		).start()
+
 	def _render_results(self, results) -> None:
 		self._clear_results()
 		self.results = list(results)
 		self.has_more_results = len(results) >= self.current_limit
-		for idx, item in enumerate(results):
-			iid = str(idx)
-			row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0)
-			row.grid(row=idx, column=0, sticky="ew")
-			row.columnconfigure(0, minsize=self.col_check_px, weight=0)
-			row.columnconfigure(1, minsize=self.col_thumb_px, weight=0)
-			row.columnconfigure(2, minsize=self.col_title_px, weight=0)
-			row.columnconfigure(3, minsize=self.col_duration_px, weight=0)
-			row.columnconfigure(4, minsize=self.col_channel_px, weight=1)
-
-			check_var = tk.BooleanVar(value=False)
-			check_btn = ctk.CTkCheckBox(
-				row,
-				text="",
-				variable=check_var,
-				command=lambda rid=iid, var=check_var: self._on_checkbutton_toggle(rid, var),
-				width=10,
-			)
-			check_btn.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(4, 2))
-
-			thumb_lbl = ctk.CTkLabel(row, image=self.placeholder_thumb, text="")
-			thumb_lbl.grid(row=0, column=1, rowspan=2, padx=(2, 6), pady=4, sticky="n")
-
-			title_lbl = ctk.CTkLabel(
-				row,
-				text=item.get("title") or "Sin titulo",
-				text_color="#000000",
-				anchor="w",
-				justify="left",
-				wraplength=self.col_title_px - 8,
-				fg_color="transparent",
-			)
-			title_lbl.grid(row=0, column=2, sticky="ew", pady=(4, 0))
-
-			url_text = item.get("url") or ""
-			url_lbl = ctk.CTkLabel(
-				row,
-				text=url_text,
-				text_color="#0b57d0",
-				cursor="hand2",
-				anchor="w",
-				justify="left",
-				wraplength=self.col_title_px - 8,
-				fg_color="transparent",
-			)
-			url_lbl.grid(row=1, column=2, sticky="ew", pady=(0, 4))
-
-			duration_lbl = ctk.CTkLabel(
-				row,
-				text=item["duration"],
-				text_color="#000000",
-				anchor="center",
-				width=80,
-				fg_color="transparent",
-			)
-			duration_lbl.grid(row=0, column=3, rowspan=2, sticky="n", pady=(18, 0), padx=(0, 6))
-
-			channel_lbl = ctk.CTkLabel(
-				row,
-				text=item["channel"],
-				text_color="#000000",
-				anchor="w",
-				fg_color="transparent",
-			)
-			channel_lbl.grid(row=0, column=4, rowspan=2, sticky="w", padx=(6, 6))
-
-			for widget in (row, thumb_lbl, title_lbl, duration_lbl, channel_lbl):
-				widget.bind("<Button-1>", lambda e, rid=iid: self._on_row_click_toggle(rid, e))
-				widget.bind("<MouseWheel>", self._on_results_mousewheel)
-				widget.bind("<Button-4>", self._on_results_mousewheel)
-				widget.bind("<Button-5>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-1>", lambda e, rid=iid: self._on_url_click(rid, e))
-			url_lbl.bind("<MouseWheel>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-4>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-5>", self._on_results_mousewheel)
-			check_btn.bind("<MouseWheel>", self._on_results_mousewheel)
-			check_btn.bind("<Button-4>", self._on_results_mousewheel)
-			check_btn.bind("<Button-5>", self._on_results_mousewheel)
-
-			self.row_widgets[iid] = {
-				"check": check_btn,
-				"check_var": check_var,
-				"thumb": thumb_lbl,
-			}
-		self._render_load_more_button()
-		if Image is not None and ImageTk is not None:
-			threading.Thread(target=self._thumbnail_worker, args=(results,), daemon=True).start()
+		if not results:
+			self._render_load_more_button()
+			self.status_var.set("Resultados: 0")
+			return
+		self.status_var.set(f"Resultados: {len(results)}")
+		self._update_virtual_scrollregion()
+		self._schedule_virtual_refresh()
+		self._start_thumbnail_loading(results)
 
 	def _append_results(self, new_results) -> None:
 		start_idx = len(self.results)
 		self.results.extend(new_results)
-		for offset, item in enumerate(new_results):
-			idx = start_idx + offset
-			iid = str(idx)
-			row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0)
-			row.grid(row=idx, column=0, sticky="ew")
-			row.columnconfigure(0, minsize=self.col_check_px, weight=0)
-			row.columnconfigure(1, minsize=self.col_thumb_px, weight=0)
-			row.columnconfigure(2, minsize=self.col_title_px, weight=0)
-			row.columnconfigure(3, minsize=self.col_duration_px, weight=0)
-			row.columnconfigure(4, minsize=self.col_channel_px, weight=1)
+		if not new_results:
+			self._render_load_more_button()
+			return
+		self._update_virtual_scrollregion()
+		self._schedule_virtual_refresh()
+		self._start_thumbnail_loading(new_results, start_idx)
 
-			check_var = tk.BooleanVar(value=False)
-			check_btn = ctk.CTkCheckBox(
-				row,
-				text="",
-				variable=check_var,
-				command=lambda rid=iid, var=check_var: self._on_checkbutton_toggle(rid, var),
-				width=10,
-			)
-			check_btn.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(4, 2))
-
-			thumb_lbl = ctk.CTkLabel(row, image=self.placeholder_thumb, text="")
-			thumb_lbl.grid(row=0, column=1, rowspan=2, padx=(2, 6), pady=4, sticky="n")
-
-			title_lbl = ctk.CTkLabel(
-				row,
-				text=item.get("title") or "Sin titulo",
-				text_color="#000000",
-				anchor="w",
-				justify="left",
-				wraplength=self.col_title_px - 8,
-				fg_color="transparent",
-			)
-			title_lbl.grid(row=0, column=2, sticky="ew", pady=(4, 0))
-
-			url_text = item.get("url") or ""
-			url_lbl = ctk.CTkLabel(
-				row,
-				text=url_text,
-				text_color="#0b57d0",
-				cursor="hand2",
-				anchor="w",
-				justify="left",
-				wraplength=self.col_title_px - 8,
-				fg_color="transparent",
-			)
-			url_lbl.grid(row=1, column=2, sticky="ew", pady=(0, 4))
-
-			duration_lbl = ctk.CTkLabel(
-				row,
-				text=item["duration"],
-				text_color="#000000",
-				anchor="center",
-				width=80,
-				fg_color="transparent",
-			)
-			duration_lbl.grid(row=0, column=3, rowspan=2, sticky="n", pady=(18, 0), padx=(0, 6))
-
-			channel_lbl = ctk.CTkLabel(
-				row,
-				text=item["channel"],
-				text_color="#000000",
-				anchor="w",
-				fg_color="transparent",
-			)
-			channel_lbl.grid(row=0, column=4, rowspan=2, sticky="w", padx=(6, 6))
-
-			for widget in (row, thumb_lbl, title_lbl, duration_lbl, channel_lbl):
-				widget.bind("<Button-1>", lambda e, rid=iid: self._on_row_click_toggle(rid, e))
-				widget.bind("<MouseWheel>", self._on_results_mousewheel)
-				widget.bind("<Button-4>", self._on_results_mousewheel)
-				widget.bind("<Button-5>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-1>", lambda e, rid=iid: self._on_url_click(rid, e))
-			url_lbl.bind("<MouseWheel>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-4>", self._on_results_mousewheel)
-			url_lbl.bind("<Button-5>", self._on_results_mousewheel)
-			check_btn.bind("<MouseWheel>", self._on_results_mousewheel)
-			check_btn.bind("<Button-4>", self._on_results_mousewheel)
-			check_btn.bind("<Button-5>", self._on_results_mousewheel)
-
-			self.row_widgets[iid] = {
-				"check": check_btn,
-				"check_var": check_var,
-				"thumb": thumb_lbl,
-			}
-		self._render_load_more_button()
-		if Image is not None and ImageTk is not None and new_results:
-			threading.Thread(target=self._thumbnail_worker, args=(new_results, start_idx), daemon=True).start()
-
-	def _thumbnail_worker(self, results, idx_offset: int = 0) -> None:
+	def _thumbnail_worker(self, results, idx_offset: int = 0, generation: Optional[int] = None) -> None:
 		for idx, item in enumerate(results):
+			if generation is not None and generation != self.thumbnail_generation:
+				return
 			thumb_url = item.get("thumbnail_url")
 			if not thumb_url:
 				continue
@@ -899,7 +960,7 @@ class YouTubeDownloaderApp:
 					with urlopen(thumb_url, timeout=12) as response:
 						thumb_data = response.read()
 				
-				if thumb_data:
+				if thumb_data and (generation is None or generation == self.thumbnail_generation):
 					self.output_queue.put(("thumbnail", (idx + idx_offset, thumb_data)))
 			except Exception:
 				continue
@@ -924,6 +985,78 @@ class YouTubeDownloaderApp:
 		except Exception:
 			return
 
+	def _default_download_folder(self) -> str:
+		candidates = [
+			self.last_download_folder,
+			os.path.join(os.path.expanduser("~"), "Downloads"),
+			os.path.join(os.path.expanduser("~"), "Desktop"),
+			os.path.expanduser("~"),
+		]
+		for candidate in candidates:
+			if candidate and os.path.isdir(candidate):
+				return candidate
+		fallback = os.path.join(os.path.expanduser("~"), "Downloads")
+		try:
+			os.makedirs(fallback, exist_ok=True)
+		except Exception:
+			return os.path.expanduser("~")
+		return fallback
+
+	def _ask_download_directory(self) -> str:
+		title = "Selecciona la carpeta de descarga"
+		initial_dir = self._default_download_folder()
+		try:
+			selected = filedialog.askdirectory(
+				parent=self.root,
+				title=title,
+				initialdir=initial_dir,
+				mustexist=True,
+			) or ""
+			if selected:
+				self.last_download_folder = selected
+			return selected
+		except tk.TclError as exc:
+			self._log(f"Error al abrir selector de carpeta: {exc}")
+
+		# Reintento sin parent para evitar fallos intermitentes del dialogo nativo.
+		try:
+			self.root.update_idletasks()
+			selected = filedialog.askdirectory(
+				title=title,
+				initialdir=initial_dir,
+				mustexist=True,
+			) or ""
+			if selected:
+				self.last_download_folder = selected
+			return selected
+		except tk.TclError as exc:
+			self._log(f"Reintento de selector de carpeta fallido: {exc}")
+
+		manual = simpledialog.askstring(
+			"Carpeta de descarga",
+			"No se pudo abrir el selector de carpetas.\n\n"
+			"Escribe la ruta completa de la carpeta de descarga:",
+			initialvalue=initial_dir,
+			parent=self.root,
+		)
+		if not manual:
+			fallback = self._default_download_folder()
+			self._log(f"Usando carpeta por defecto: {fallback}")
+			self.last_download_folder = fallback
+			return fallback
+		manual = manual.strip().strip('"')
+		if os.path.isdir(manual):
+			self.last_download_folder = manual
+			return manual
+		fallback = self._default_download_folder()
+		messagebox.showwarning(
+			"Ruta invalida",
+			"La ruta ingresada no existe o no es una carpeta valida.\n"
+			f"Se usara la carpeta por defecto:\n{fallback}",
+		)
+		self.last_download_folder = fallback
+		return fallback
+
 	def download_selected(self) -> None:
 		if yt_dlp is None:
 			return
@@ -935,7 +1068,7 @@ class YouTubeDownloaderApp:
 			messagebox.showinfo("Sin seleccion", "Selecciona al menos un video para descargar.")
 			return
 
-		folder = filedialog.askdirectory(title="Selecciona la carpeta de descarga")
+		folder = self._ask_download_directory()
 		if not folder:
 			return
 
@@ -1025,9 +1158,6 @@ class YouTubeDownloaderApp:
 				{
 					"format": format_selector,
 					"merge_output_format": "mp4",
-					"postprocessor_args": {
-						"Merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
-					},
 				}
 			)
 
