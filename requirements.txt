@@ -3,5 +3,6 @@ customtkinter
 pillow
 imageio-ffmpeg
 certifi
-pywebview
+pywebview==6.1
+pythonnet==3.1.0rc0; platform_system == "Windows"
 pyinstaller
