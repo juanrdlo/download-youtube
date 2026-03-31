@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='youtuber',
+    name='YouTuber',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,10 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-app = BUNDLE(
-    exe,
-    name='youtuber.app',
-    icon=None,
-    bundle_identifier=None,
 )

@@ -71,6 +71,7 @@ class YouTubeDownloaderApp:
 		self.placeholder_thumb = None
 		self.ffmpeg_location = self._resolve_ffmpeg_location()
 		self.ca_bundle_path = self._configure_ssl_certificates()
+		self.cookies_from_browsers = self._detect_cookies_browsers()
 		self.last_download_folder = os.path.expanduser("~")
 		self.search_mode = tk.StringVar(value="normal")  # "normal" o "playlist"
 		self.last_placeholder = "Buscar videos..."  # guardar el placeholder anterior
@@ -106,8 +107,35 @@ class YouTubeDownloaderApp:
 			self._log(f"ffmpeg detectado: {self.ffmpeg_location}")
 		else:
 			self._log("ffmpeg no detectado: para mejor opcion 1080p instala ffmpeg o imageio-ffmpeg.")
+		if self.cookies_from_browsers:
+			names = ", ".join(browser[0] for browser in self.cookies_from_browsers)
+			self._log(f"Cookies de navegador habilitadas (orden de prueba): {names}")
+		else:
+			self._log("No se detectaron cookies de navegador. Algunos videos con restriccion de edad pueden fallar.")
 		if webview is None:
 			self._log("Sugerencia: instala pywebview para reproductor embebido (pip install pywebview).")
+
+	def _detect_cookies_browsers(self):
+		local_app_data = os.environ.get("LOCALAPPDATA", "")
+		app_data = os.environ.get("APPDATA", "")
+		candidates = [
+			("chrome", os.path.join(local_app_data, "Google", "Chrome", "User Data")),
+			("edge", os.path.join(local_app_data, "Microsoft", "Edge", "User Data")),
+			("brave", os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "User Data")),
+			("firefox", os.path.join(app_data, "Mozilla", "Firefox", "Profiles")),
+		]
+		detected = []
+		for browser_name, browser_path in candidates:
+			if browser_path and os.path.isdir(browser_path):
+				detected.append((browser_name,))
+		return detected
+
+	def _iter_cookie_option_variants(self, base_options: dict):
+		for browser in self.cookies_from_browsers:
+			options = dict(base_options)
+			options["cookiesfrombrowser"] = browser
+			yield options, browser[0]
+		yield dict(base_options), None
 
 	def _configure_ssl_certificates(self) -> Optional[str]:
 		if certifi is None:
@@ -130,6 +158,20 @@ class YouTubeDownloaderApp:
 			or "certificateverifyerror" in message
 			or "unable to get local issuer certificate" in message
 		)
+
+	@staticmethod
+	def _is_age_restricted_error(exc: Exception) -> bool:
+		message = str(exc).lower()
+		return (
+			"sign in to confirm your age" in message
+			or "use --cookies-from-browser" in message
+			or "this video may be inappropriate" in message
+		)
+
+	@staticmethod
+	def _is_cookie_db_copy_error(exc: Exception) -> bool:
+		message = str(exc).lower()
+		return "could not copy" in message and "cookie" in message and "database" in message
 
 	def _resolve_ffmpeg_location(self) -> Optional[str]:
 		system_ffmpeg = shutil.which("ffmpeg")
@@ -504,24 +546,52 @@ class YouTubeDownloaderApp:
 			else:
 				search_query = f"ytsearch{max_results}:{query}"
 			info = None
-			for use_insecure in (False, True):
-				options = dict(base_options)
-				if use_insecure:
-					options["nocheckcertificate"] = True
-				try:
-					with yt_dlp.YoutubeDL(options) as ydl:
-						info = ydl.extract_info(search_query, download=False)
-					break
-				except Exception as exc:
-					if not use_insecure and self._is_ssl_certificate_error(exc):
-						self.output_queue.put(
-							(
-								"log",
-								"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+			last_exc = None
+			for cookie_options, cookie_label in self._iter_cookie_option_variants(base_options):
+				for use_insecure in (False, True):
+					options = dict(cookie_options)
+					if use_insecure:
+						options["nocheckcertificate"] = True
+					try:
+						with yt_dlp.YoutubeDL(options) as ydl:
+							info = ydl.extract_info(search_query, download=False)
+						break
+					except Exception as exc:
+						last_exc = exc
+						if cookie_label and self._is_cookie_db_copy_error(exc):
+							self.output_queue.put(
+								(
+									"log",
+									f"No se pudieron leer cookies de {cookie_label}. Probando otro navegador o modo sin cookies.",
+								)
 							)
-						)
-						continue
-					raise
+							break
+						if not use_insecure and self._is_ssl_certificate_error(exc):
+							self.output_queue.put(
+								(
+									"log",
+									"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+								)
+							)
+							continue
+						if self._is_age_restricted_error(exc):
+							if self.cookies_from_browsers:
+								raise RuntimeError(
+									"Video restringido por edad. Verifica que haya sesion iniciada en YouTube y cierra el navegador antes de intentar de nuevo."
+								) from exc
+							raise RuntimeError(
+								"YouTube solicita confirmar edad. Inicia sesion en YouTube desde Chrome/Edge/Brave/Firefox y vuelve a intentar."
+							) from exc
+						if use_insecure:
+							break
+				else:
+					continue
+				if info is not None:
+					break
+			if info is not None:
+				pass
+			elif last_exc is not None:
+				raise last_exc
 			entries = info.get("entries", []) if info else []
 			parsed = []
 			skipped_unavailable = 0
@@ -1161,30 +1231,84 @@ class YouTubeDownloaderApp:
 				}
 			)
 
-		try:
-			for use_insecure in (False, True):
-				options = dict(base_options)
-				if use_insecure:
-					options["nocheckcertificate"] = True
-				try:
-					with yt_dlp.YoutubeDL(options) as ydl:
-						for i, url in enumerate(urls):
-							current_index["value"] = i
-							self.output_queue.put(("log", f"Descargando ({i + 1}/{total}): {url}"))
+		def _download_one_url(url: str):
+			last_exc = None
+			for cookie_options, cookie_label in self._iter_cookie_option_variants(base_options):
+				for use_insecure in (False, True):
+					options = dict(cookie_options)
+					if use_insecure:
+						options["nocheckcertificate"] = True
+					try:
+						with yt_dlp.YoutubeDL(options) as ydl:
 							ydl.download([url])
-					break
+						return True, None
+					except Exception as exc:
+						last_exc = exc
+						if cookie_label and self._is_cookie_db_copy_error(exc):
+							self.output_queue.put(
+								(
+									"log",
+									f"No se pudieron leer cookies de {cookie_label}. Probando otro navegador o modo sin cookies.",
+								)
+							)
+							break
+						if not use_insecure and self._is_ssl_certificate_error(exc):
+							self.output_queue.put(
+								(
+									"log",
+									"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+								)
+							)
+							continue
+						if self._is_age_restricted_error(exc):
+							return False, "age_restricted"
+						if use_insecure:
+							break
+			if last_exc is not None:
+				raise last_exc
+			return False, "unknown"
+
+		try:
+			skipped_age_urls = []
+			failed_urls = []
+			success_count = 0
+			for i, url in enumerate(urls):
+				current_index["value"] = i
+				self.output_queue.put(("log", f"Descargando ({i + 1}/{total}): {url}"))
+				try:
+					success, reason = _download_one_url(url)
 				except Exception as exc:
-					if not use_insecure and self._is_ssl_certificate_error(exc):
+					failed_urls.append((url, str(exc)))
+					self.output_queue.put(("log", f"Error al descargar {url}: {exc}"))
+				else:
+					if success:
+						success_count += 1
+					elif reason == "age_restricted":
+						skipped_age_urls.append(url)
 						self.output_queue.put(
 							(
 								"log",
-								"Aviso SSL: no se pudo validar certificado. Reintentando en modo compatible.",
+								"Video omitido por restriccion de edad. Continuando con el siguiente.",
 							)
 						)
-						continue
-					raise
+					else:
+						failed_urls.append((url, "Fallo desconocido"))
+				self.output_queue.put(("progress", ((i + 1) / total) * 100))
+
+			if failed_urls or skipped_age_urls:
+				self.output_queue.put(
+					(
+						"download_partial_done",
+						{
+							"success": success_count,
+							"skipped_age": len(skipped_age_urls),
+							"failed": len(failed_urls),
+						},
+					)
+				)
+			else:
+				self.output_queue.put(("download_done", None))
 			self.output_queue.put(("progress", 100))
-			self.output_queue.put(("download_done", None))
 		except Exception as exc:  # pragma: no cover - depends on network/runtime
 			self.output_queue.put(("error", f"Error de descarga: {exc}"))
 
@@ -1224,6 +1348,22 @@ class YouTubeDownloaderApp:
 					self._log("Descarga finalizada correctamente.")
 					self._set_controls_state("normal")
 					messagebox.showinfo("Finalizado", "Se completaron todas las descargas.")
+				elif item_type == "download_partial_done":
+					self.downloading = False
+					success = int(payload.get("success", 0))
+					skipped_age = int(payload.get("skipped_age", 0))
+					failed = int(payload.get("failed", 0))
+					self.status_var.set("Descarga completada con omisiones")
+					self._log(
+						f"Descarga terminada con omisiones. Exitosos: {success}, Omitidos por edad: {skipped_age}, Fallidos: {failed}."
+					)
+					self._set_controls_state("normal")
+					messagebox.showwarning(
+						"Descarga parcial",
+						f"Se completaron {success} descarga(s).\n"
+						f"Omitidos por edad: {skipped_age}\n"
+						f"Fallidos por otros errores: {failed}",
+					)
 				elif item_type == "log":
 					self._log(payload)
 				elif item_type == "thumbnail":
