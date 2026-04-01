@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
-from PyInstaller.building.api import EXE, PYZ, COLLECT, APP
-from PyInstaller.building.build_main import Analysis
+from PyInstaller.building.build_main import Analysis, PYZ, EXE, COLLECT
+from PyInstaller.building.osx import BUNDLE
 
 
 a = Analysis(
@@ -17,7 +17,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-pyz = PYZ(a.pure)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 # Para Windows
 if sys.platform.startswith('win'):
@@ -69,7 +70,7 @@ elif sys.platform == 'darwin':
         disable_windowed_traceback=False,
         argv_emulation=False,
     )
-    app = APP(
+    app = BUNDLE(
         exe,
         name='YouTuber.app',
         icon=None,
@@ -77,15 +78,8 @@ elif sys.platform == 'darwin':
         info_plist={
             'NSPrincipalClass': 'NSApplication',
             'NSHighResolutionCapable': 'True',
+            'NSMinimumOSVersion': '11.0',
         },
     )
-    coll = COLLECT(
-        app,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
-        strip=False,
-        upx=True,
-        upx_exclude=[],
-        name='YouTuber',
-    )
+else:
+    raise RuntimeError(f"Plataforma no soportada: {sys.platform}")
