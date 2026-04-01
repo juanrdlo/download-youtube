@@ -85,6 +85,11 @@ class YouTubeDownloaderApp:
 		self.row_height = 76
 		self.virtual_buffer_rows = 8
 		self.virtual_after_id = None
+		self.render_after_id = None
+		self.rendered_until_idx = -1
+		self.enable_virtual_rows = False
+		self.virtual_rows_threshold = 1200
+		self.max_thumbnail_jobs_virtual = 120
 
 		self._build_ui()
 		self._poll_queue()
@@ -645,6 +650,12 @@ class YouTubeDownloaderApp:
 	def _clear_results(self) -> None:
 		self.render_generation += 1
 		self.thumbnail_generation += 1
+		if self.render_after_id is not None:
+			try:
+				self.root.after_cancel(self.render_after_id)
+			except Exception:
+				pass
+			self.render_after_id = None
 		if self.virtual_after_id is not None:
 			try:
 				self.root.after_cancel(self.virtual_after_id)
@@ -656,6 +667,7 @@ class YouTubeDownloaderApp:
 		self.thumbnail_images.clear()
 		self.thumbnail_limit_logged = False
 		self.has_more_results = False
+		self.rendered_until_idx = -1
 		self.selected_count_var.set("Seleccionados: 0")
 		self.selected_text.configure(state="normal")
 		self.selected_text.delete("1.0", "end")
@@ -673,21 +685,24 @@ class YouTubeDownloaderApp:
 			self.load_more_btn = None
 		if not self.has_more_results:
 			self._update_virtual_scrollregion()
-			self._schedule_virtual_refresh()
+			if self.enable_virtual_rows:
+				self._schedule_virtual_refresh()
 			return
+		page_step = max(1, int(self.max_results_var.get() or self.page_step))
 		row = ctk.CTkFrame(self.rows_frame, fg_color="#ffffff", corner_radius=0, width=1, height=44)
 		row.place(x=0, y=len(self.results) * self.row_height + 8, relwidth=1.0)
 		row.columnconfigure(0, weight=1)
 		self.load_more_btn = ctk.CTkButton(
 			row,
-			text="Cargar 20 mas",
+			text=f"Cargar {page_step} mas",
 			command=self.load_more_results,
 		)
 		self.load_more_btn.grid(row=0, column=0)
 		if self.loading_more:
 			self.load_more_btn.configure(state="disabled")
 		self._update_virtual_scrollregion()
-		self._schedule_virtual_refresh()
+		if self.enable_virtual_rows:
+			self._schedule_virtual_refresh()
 
 	def load_more_results(self) -> None:
 		if yt_dlp is None:
@@ -699,7 +714,8 @@ class YouTubeDownloaderApp:
 		if self.load_more_btn is not None:
 			self.load_more_btn.configure(state="disabled", text="Cargando...")
 		known_ids = {item.get("id") for item in self.results if item.get("id")}
-		next_limit = self.current_limit + self.page_step
+		page_step = max(1, int(self.max_results_var.get() or self.page_step))
+		next_limit = self.current_limit + page_step
 		search_mode = self.search_mode.get()
 		worker = threading.Thread(
 			target=self._search_worker,
@@ -715,11 +731,15 @@ class YouTubeDownloaderApp:
 		self.results_canvas.itemconfigure(self.rows_window, width=event.width)
 		self.rows_frame.configure(width=event.width)
 		self._update_virtual_scrollregion()
-		self._schedule_virtual_refresh()
+		if self.enable_virtual_rows:
+			self._schedule_virtual_refresh()
 
 	def _on_canvas_yscroll(self, first: str, last: str) -> None:
 		self.y_scroll.set(first, last)
-		self._schedule_virtual_refresh()
+		if self.enable_virtual_rows:
+			self._schedule_virtual_refresh()
+		else:
+			self._ensure_rows_for_current_view()
 
 	def _update_virtual_scrollregion(self) -> None:
 		canvas_w = max(1, self.results_canvas.winfo_width())
@@ -729,13 +749,39 @@ class YouTubeDownloaderApp:
 		self.rows_frame.configure(width=canvas_w, height=content_height)
 		self.results_canvas.configure(scrollregion=(0, 0, canvas_w, content_height))
 
+	def _set_render_mode_for_results(self, total_count: int) -> None:
+		use_virtual = total_count >= self.virtual_rows_threshold
+		if use_virtual == self.enable_virtual_rows:
+			return
+		self.enable_virtual_rows = use_virtual
+		if self.render_after_id is not None:
+			try:
+				self.root.after_cancel(self.render_after_id)
+			except Exception:
+				pass
+			self.render_after_id = None
+		if self.virtual_after_id is not None:
+			try:
+				self.root.after_cancel(self.virtual_after_id)
+			except Exception:
+				pass
+			self.virtual_after_id = None
+		for child in self.rows_frame.winfo_children():
+			child.destroy()
+		self.row_widgets.clear()
+		self.load_more_btn = None
+
 	def _schedule_virtual_refresh(self) -> None:
+		if not self.enable_virtual_rows:
+			return
 		if self.virtual_after_id is not None:
 			return
 		self.virtual_after_id = self.root.after(12, self._refresh_visible_rows)
 
 	def _refresh_visible_rows(self) -> None:
 		self.virtual_after_id = None
+		if not self.enable_virtual_rows:
+			return
 		if not self.results:
 			for iid in list(self.row_widgets):
 				row = self.row_widgets[iid].get("row")
@@ -791,8 +837,68 @@ class YouTubeDownloaderApp:
 				delta_units = -int(delta / 120)
 		if delta_units:
 			self.results_canvas.yview_scroll(delta_units, "units")
-			self._schedule_virtual_refresh()
+			if self.enable_virtual_rows:
+				self._schedule_virtual_refresh()
+			else:
+				self._ensure_rows_for_current_view()
 		return "break"
+
+	def _ensure_rows_for_current_view(self) -> None:
+		if self.enable_virtual_rows or not self.results:
+			return
+		canvas_h = max(1, self.results_canvas.winfo_height())
+		y1 = max(0, self.results_canvas.canvasy(0)) + canvas_h
+		target_idx = min(len(self.results) - 1, int(y1 // self.row_height) + self.virtual_buffer_rows)
+		if target_idx <= self.rendered_until_idx:
+			return
+		if self.render_after_id is not None:
+			try:
+				self.root.after_cancel(self.render_after_id)
+			except Exception:
+				pass
+			self.render_after_id = None
+		start_idx = max(0, self.rendered_until_idx + 1)
+		for idx in range(start_idx, target_idx + 1):
+			iid = str(idx)
+			if iid in self.row_widgets:
+				continue
+			self._build_result_row(idx, self.results[idx])
+		self.rendered_until_idx = max(self.rendered_until_idx, target_idx)
+		self._update_virtual_scrollregion()
+		if self.rendered_until_idx + 1 < len(self.results):
+			self.render_after_id = self.root.after(
+				1,
+				lambda next_idx=self.rendered_until_idx + 1: self._render_rows_chunk(next_idx),
+			)
+
+	def _render_all_rows(self, start_idx: int = 0) -> None:
+		if self.render_after_id is not None:
+			try:
+				self.root.after_cancel(self.render_after_id)
+			except Exception:
+				pass
+			self.render_after_id = None
+		if start_idx <= 0:
+			self.rendered_until_idx = -1
+		self._render_rows_chunk(start_idx)
+
+	def _render_rows_chunk(self, start_idx: int) -> None:
+		if self.enable_virtual_rows:
+			self.render_after_id = None
+			return
+		end_idx = min(len(self.results), start_idx + self.render_batch_size)
+		for idx in range(start_idx, end_idx):
+			iid = str(idx)
+			if iid in self.row_widgets:
+				continue
+			self._build_result_row(idx, self.results[idx])
+		if end_idx > 0:
+			self.rendered_until_idx = max(self.rendered_until_idx, end_idx - 1)
+		self._update_virtual_scrollregion()
+		if end_idx < len(self.results):
+			self.render_after_id = self.root.after(1, lambda next_idx=end_idx: self._render_rows_chunk(next_idx))
+		else:
+			self.render_after_id = None
 
 	def _select_all(self) -> None:
 		if not self.results:
@@ -970,18 +1076,19 @@ class YouTubeDownloaderApp:
 	def _start_thumbnail_loading(self, results, idx_offset: int = 0) -> None:
 		if Image is None or ImageTk is None or not results:
 			return
-		remaining = self.max_thumbnail_jobs - len(self.thumbnail_images)
+		thumbnail_cap = self.max_thumbnail_jobs_virtual if self.enable_virtual_rows else self.max_thumbnail_jobs
+		remaining = thumbnail_cap - len(self.thumbnail_images)
 		if remaining <= 0:
 			if not self.thumbnail_limit_logged:
 				self._log(
-					f"Miniaturas limitadas a {self.max_thumbnail_jobs} para mantener fluida la interfaz."
+					f"Miniaturas limitadas a {thumbnail_cap} para mantener fluida la interfaz."
 				)
 				self.thumbnail_limit_logged = True
 			return
 		chunk = results[:remaining]
 		if len(chunk) < len(results) and not self.thumbnail_limit_logged:
 			self._log(
-				f"Miniaturas limitadas a {self.max_thumbnail_jobs} para mantener fluida la interfaz."
+				f"Miniaturas limitadas a {thumbnail_cap} para mantener fluida la interfaz."
 			)
 			self.thumbnail_limit_logged = True
 		generation = self.thumbnail_generation
@@ -994,6 +1101,7 @@ class YouTubeDownloaderApp:
 	def _render_results(self, results) -> None:
 		self._clear_results()
 		self.results = list(results)
+		self._set_render_mode_for_results(len(self.results))
 		self.has_more_results = len(results) >= self.current_limit
 		if not results:
 			self._render_load_more_button()
@@ -1001,17 +1109,26 @@ class YouTubeDownloaderApp:
 			return
 		self.status_var.set(f"Resultados: {len(results)}")
 		self._update_virtual_scrollregion()
-		self._schedule_virtual_refresh()
+		if self.enable_virtual_rows:
+			self._schedule_virtual_refresh()
+		else:
+			self._render_all_rows()
+		self._render_load_more_button()
 		self._start_thumbnail_loading(results)
 
 	def _append_results(self, new_results) -> None:
 		start_idx = len(self.results)
 		self.results.extend(new_results)
+		self._set_render_mode_for_results(len(self.results))
 		if not new_results:
 			self._render_load_more_button()
 			return
 		self._update_virtual_scrollregion()
-		self._schedule_virtual_refresh()
+		if self.enable_virtual_rows:
+			self._schedule_virtual_refresh()
+		else:
+			self._render_all_rows(start_idx)
+		self._render_load_more_button()
 		self._start_thumbnail_loading(new_results, start_idx)
 
 	def _thumbnail_worker(self, results, idx_offset: int = 0, generation: Optional[int] = None) -> None:
