@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
+from PyInstaller.building.api import EXE, PYZ, COLLECT, Analysis, APP
 
 
 a = Analysis(
